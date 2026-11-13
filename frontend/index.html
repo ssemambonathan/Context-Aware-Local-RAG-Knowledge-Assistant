@@ -1,103 +1,4 @@
-<!DOCTYPE html>
-<html lang="en" class="dark">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Local RAG Architectural Assistant</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-</head>
-<body class="bg-slate-950 text-slate-100 h-screen overflow-hidden font-sans">
-  <div id="root" class="h-full"></div>
-
-  <script type="text/babel">
-    const { useState, useEffect, useRef } = React;
-
-    function App() {
-      const [health, setHealth] = useState({ ollama_connected: false, models: [], stats: { total_chunks: 0, indexed_files: [] } });
-      const [dirPath, setDirPath] = useState("");
-      const [chatModel, setChatModel] = useState("qwen2.5-coder");
-      const [embedModel, setEmbedModel] = useState("nomic-embed-text");
-      const [ingesting, setIngesting] = useState(false);
-      const [statusMsg, setStatusMsg] = useState("");
-
-      const [messages, setMessages] = useState([
-        {
-          role: "assistant",
-          content: "Index a local codebase directory or upload PDFs/docs on the left, then ask architectural questions about your code.",
-          sources: []
-        }
-      ]);
-      const [input, setInput] = useState("");
-      const [loading, setLoading] = useState(false);
-      const bottomRef = useRef(null);
-
-      const refreshHealth = async () => {
-        try {
-          const res = await fetch("/api/health");
-          const data = await res.json();
-          setHealth(data);
-        } catch (e) {
-          console.error(e);
-        }
-      };
-
-      useEffect(() => { refreshHealth(); }, []);
-      useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
-
-      const handleDirIngest = async (e) => {
-        e.preventDefault();
-        if (!dirPath.trim()) return;
-        setIngesting(true);
-        setStatusMsg("Parsing AST & generating embeddings...");
-        try {
-          const res = await fetch("/api/ingest/directory", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ directory_path: dirPath, embed_model: embedModel })
-          });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || "Failed");
-          setStatusMsg(`Indexed ${data.files_processed} files (${data.chunks_indexed} chunks).`);
-          refreshHealth();
-        } catch (err) {
-          setStatusMsg(`Error: ${err.message}`);
-        } finally {
-          setIngesting(false);
-        }
-      };
-
-      const handleFileUpload = async (e) => {
-        const files = e.target.files;
-        if (!files.length) return;
-        setIngesting(true);
-        setStatusMsg(`Uploading & indexing ${files.length} file(s)...`);
-        const formData = new FormData();
-        for (let f of files) formData.append("files", f);
-        try {
-          const res = await fetch(`/api/ingest/files?embed_model=${encodeURIComponent(embedModel)}`, {
-            method: "POST",
-            body: formData
-          });
-          const data = await res.json();
-          setStatusMsg(`Indexed ${data.files_processed} files (${data.chunks_indexed} chunks).`);
-          refreshHealth();
-        } catch (err) {
-          setStatusMsg(`Error: ${err.message}`);
-        } finally {
-          setIngesting(false);
-        }
-      };
-
-      const handleClear = async () => {
-        await fetch("/api/index", { method: "DELETE" });
-        setStatusMsg("Vector database cleared.");
-        refreshHealth();
-      };
-
-      const sendQuery = async (e) => {
+const sendQuery = async (e) => {
         e.preventDefault();
         if (!input.trim() || loading) return;
         const userQ = input.trim();
@@ -105,127 +6,52 @@
         setMessages(prev => [...prev, { role: "user", content: userQ }]);
         setLoading(true);
 
+        // Add placeholder for assistant message
+        setMessages(prev => [...prev, { role: "assistant", content: "", sources: [] }]);
+
         try {
-          const res = await fetch("/api/query", {
+          const res = await fetch("/api/query-stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ question: userQ, chat_model: chatModel, embed_model: embedModel })
           });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || "Query failed");
-          setMessages(prev => [...prev, { role: "assistant", content: data.answer, sources: data.sources || [] }]);
+
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n\n");
+            buffer = lines.pop(); // Keep incomplete chunk in buffer
+
+            for (let line of lines) {
+              if (line.startsWith("data: ")) {
+                const jsonStr = line.replace("data: ", "");
+                const pkt = JSON.parse(jsonStr);
+
+                setMessages(prev => {
+                  const updated = [...prev];
+                  const lastMsg = updated[updated.length - 1];
+                  if (pkt.type === "sources") {
+                    lastMsg.sources = pkt.sources;
+                  } else if (pkt.type === "chunk") {
+                    lastMsg.content += pkt.content;
+                  }
+                  return updated;
+                });
+              }
+            }
+          }
         } catch (err) {
-          setMessages(prev => [...prev, { role: "assistant", content: `Error: ${err.message}`, sources: [] }]);
+          setMessages(prev => {
+            const updated = [...prev];
+            updated[updated.length - 1].content = `Error: ${err.message}`;
+            return updated;
+          });
         } finally {
           setLoading(false);
         }
       };
-
-      return (
-        <div class="flex h-full">
-          {/* Sidebar */}
-          <aside class="w-80 bg-slate-900 border-r border-slate-800 p-4 flex flex-col gap-5 overflow-y-auto">
-            <div>
-              <h1 class="text-lg font-bold text-emerald-400">Local RAG Architect</h1>
-              <div class="flex items-center gap-2 mt-1 text-xs">
-                <span class={`w-2 h-2 rounded-full ${health.ollama_connected ? "bg-emerald-400" : "bg-rose-500"}`}></span>
-                <span class="text-slate-400">{health.ollama_connected ? "Ollama Online" : "Ollama Offline (port 11434)"}</span>
-              </div>
-            </div>
-
-            {/* Models */}
-            <div class="space-y-2 text-xs">
-              <label class="block text-slate-400 font-medium">Chat LLM (Ollama)</label>
-              <input value={chatModel} onChange={e => setChatModel(e.target.value)}
-                class="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200" />
-              <label class="block text-slate-400 font-medium pt-1">Embedding Model</label>
-              <input value={embedModel} onChange={e => setEmbedModel(e.target.value)}
-                class="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-slate-200" />
-            </div>
-
-            {/* Directory Ingestion */}
-            <form onSubmit={handleDirIngest} class="space-y-2 border-t border-slate-800 pt-4">
-              <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400">Index Local Codebase</label>
-              <input
-                type="text"
-                placeholder="/path/to/your/repo"
-                value={dirPath}
-                onChange={e => setDirPath(e.target.value)}
-                class="w-full bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-xs text-slate-200"
-              />
-              <button disabled={ingesting} class="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-medium py-2 rounded transition">
-                {ingesting ? "Indexing..." : "Scan & Index Folder"}
-              </button>
-            </form>
-
-            {/* File Upload */}
-            <div class="space-y-2 border-t border-slate-800 pt-4">
-              <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400">Upload PDFs / Docs / Code</label>
-              <input type="file" multiple onChange={handleFileUpload}
-                class="block w-full text-xs text-slate-400 file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:text-xs file:font-medium file:bg-slate-800 file:text-emerald-400 hover:file:bg-slate-700" />
-            </div>
-
-            {statusMsg && <div class="text-xs bg-slate-950 border border-slate-800 p-2.5 rounded text-emerald-300">{statusMsg}</div>}
-
-            {/* Index Stats */}
-            <div class="mt-auto border-t border-slate-800 pt-4 text-xs space-y-2">
-              <div class="flex justify-between items-center">
-                <span class="text-slate-400">Indexed Chunks: <strong class="text-slate-200">{health.stats.total_chunks}</strong></span>
-                <button onClick={handleClear} class="text-rose-400 hover:underline">Clear DB</button>
-              </div>
-              <div class="max-h-32 overflow-y-auto space-y-1 text-slate-500 font-mono text-[11px]">
-                {health.stats.indexed_files.map((f, i) => <div key={i} class="truncate">• {f}</div>)}
-              </div>
-            </div>
-          </aside>
-
-          {/* Main Chat Area */}
-          <main class="flex-1 flex flex-col bg-slate-950">
-            <div class="flex-1 overflow-y-auto p-6 space-y-6">
-              {messages.map((m, idx) => (
-                <div key={idx} class={`max-w-3xl ${m.role === "user" ? "ml-auto" : ""}`}>
-                  <div class={`rounded-xl p-4 text-sm leading-relaxed whitespace-pre-wrap ${
-                    m.role === "user" ? "bg-emerald-600/20 border border-emerald-500/30 text-emerald-100" : "bg-slate-900 border border-slate-800 text-slate-200"
-                  }`}>
-                    {m.content}
-                  </div>
-                  {m.sources && m.sources.length > 0 && (
-                    <div class="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      {m.sources.map((s, sIdx) => (
-                        <div key={sIdx} class="bg-slate-900/70 border border-slate-800 rounded p-2 text-[11px] font-mono">
-                          <div class="flex justify-between text-emerald-400">
-                            <span class="truncate font-semibold">{s.source}</span>
-                            <span>{Math.round(s.similarity * 100)}% match</span>
-                          </div>
-                          <div class="text-slate-500 mt-0.5">{s.symbol} • {s.lines}</div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              ))}
-              {loading && <div class="text-xs text-slate-400 animate-pulse">Retrieving context & generating response...</div>}
-              <div ref={bottomRef} />
-            </div>
-
-            <form onSubmit={sendQuery} class="p-4 border-t border-slate-800 bg-slate-900/50 flex gap-3">
-              <input
-                type="text"
-                placeholder="Ask about authentication flows, database schemas, or specific functions..."
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500"
-              />
-              <button disabled={loading} class="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 px-5 py-2.5 rounded-lg text-sm font-medium text-white transition">
-                Ask
-              </button>
-            </form>
-          </main>
-        </div>
-      );
-    }
-
-    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-  </script>
-</body>
-</html>
