@@ -1,0 +1,9 @@
+local-rag-assistant/
+├── backend/
+│   ├── main.py             # FastAPI server & endpoints
+│   ├── rag_engine.py       # ChromaDB vector store & Ollama integration
+│   ├── chunker.py          # AST-aware code chunker & PDF/Markdown parser
+│   └── requirements.txt    # Python dependencies
+├── frontend/
+│   └── index.html          # Self-contained React + Tailwind UI
+└── README.md               # Quickstart instructions
